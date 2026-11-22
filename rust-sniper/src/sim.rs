@@ -136,7 +136,8 @@ pub async fn simulate_batch_on_multicall3(
         json!([
             {
                 "to": multicall3_address,
-                "data": calldata_hex
+                "data": calldata_hex,
+                "gas": "0x2faf080"
             },
             "latest",
             override_obj
@@ -145,7 +146,8 @@ pub async fn simulate_batch_on_multicall3(
         json!([
             {
                 "to": multicall3_address,
-                "data": calldata_hex
+                "data": calldata_hex,
+                "gas": "0x2faf080"
             },
             "latest"
         ])

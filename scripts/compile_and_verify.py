@@ -1,22 +1,63 @@
 """
-Standalone Solidity Compiler, Artifact Generator, Unit-Test Runner & Live Base Mainnet Fork Verifier.
-1. Compiles ZeroCapOmniExecutor.sol, ZeroCapOmniExecutor.t.sol, and ZeroCapMainnetFork.t.sol.
+Standalone Solidity compiler, artifact generator, unit-test runner and live
+Base Mainnet fork verifier.
+
+1. Compiles ZeroCapOmniExecutor.sol, ZeroCapOmniExecutor.t.sol and ZeroCapMainnetFork.t.sol.
 2. Executes all 5 Solidity unit tests in ZeroCapOmniExecutorTest in the Cancun EVM.
 3. Executes ZeroCapMainnetForkTest against LIVE Base Mainnet contracts.
+
+    python scripts/compile_and_verify.py
 """
+
+from __future__ import annotations
+
 import json
 import os
 import platform
 import subprocess
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+_SCRIPTS = Path(__file__).resolve().parent
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+
+from console import (  # noqa: E402
+    ACCENT,
+    GREEN,
+    INK,
+    MUTED,
+    ensure_utf8,
+    heading,
+    paint,
+    panel,
+    status,
+)
+
+ROOT_DIR = _SCRIPTS.parent
 CONTRACTS_DIR = ROOT_DIR / "contracts"
 OUT_DIR = CONTRACTS_DIR / "out"
 SOLC_VERSION = "0.8.24"
 BASE_RPC_URL = os.getenv("BASE_RPC_URLS", "https://base-rpc.publicnode.com").split(",")[0].strip()
+
+UNIT_TESTS = [
+    "testProfitableMorphoLiquidation (strict balance-delta dust check)",
+    "testMorphoLiquidationRevertsIfBelowMinProfit",
+    "testProfitableDutchAuctionWithSlippageGuards",
+    "testProfitableHarvestBountyAndAllowlistGuard",
+    "testRevertOnUnauthorizedCallbacks",
+]
+
+FORK_TESTS = [
+    "testLiveMorphoFlashLoanAndUniswapV3Swap (real Morpho Blue + UniV3 + SimpleAccountFactory)",
+]
+
+
+def _sub_lines(names) -> None:
+    for name in names:
+        print(f"      {paint(name, MUTED)}")
 
 
 def ensure_solc_binary() -> Path:
@@ -27,6 +68,7 @@ def ensure_solc_binary() -> Path:
     solc_path = tools_dir / bin_name
 
     if solc_path.exists() and solc_path.stat().st_size > 100_000:
+        status("ok", "solc", f"v{SOLC_VERSION} cached")
         return solc_path
 
     url = (
@@ -34,83 +76,84 @@ def ensure_solc_binary() -> Path:
         if is_win
         else f"https://github.com/ethereum/solidity/releases/download/v{SOLC_VERSION}/solc-static-linux"
     )
-    print(f"[Compiler] Downloading standalone solc v{SOLC_VERSION} from {url} ...")
+    status("info", "solc", f"downloading v{SOLC_VERSION}…")
     urllib.request.urlretrieve(url, solc_path)
     if not is_win:
         os.chmod(solc_path, 0o755)
+    status("ok", "solc", f"v{SOLC_VERSION} installed")
     return solc_path
 
 
-def run_solidity_unit_tests_on_evm(test_runtime_bytecode: str, run_all_selector: str) -> None:
-    test_addr = "0x0000000000000000000000000000000000007E57"
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_call",
-        "params": [
-            {"to": test_addr, "data": "0x" + run_all_selector, "gas": hex(50_000_000)},
-            "latest",
-            {test_addr: {"code": test_runtime_bytecode}},
-        ],
-    }
+def _eth_call(payload: dict, timeout: int = 30) -> dict:
     req = urllib.request.Request(
         BASE_RPC_URL,
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json", "User-Agent": "zerro-defi-verifier/1.0"},
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        body = json.loads(resp.read().decode("utf-8"))
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
+
+def run_solidity_unit_tests_on_evm(test_runtime_bytecode: str, run_all_selector: str) -> None:
+    test_addr = "0x0000000000000000000000000000000000007E57"
+    started = time.perf_counter()
+    body = _eth_call(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_call",
+            "params": [
+                {"to": test_addr, "data": "0x" + run_all_selector, "gas": hex(50_000_000)},
+                "latest",
+                {test_addr: {"code": test_runtime_bytecode}},
+            ],
+        }
+    )
     if "error" in body:
-        raise RuntimeError(f"Solidity unit test suite reverted in EVM: {body['error']}")
+        raise RuntimeError(f"Solidity unit suite reverted in EVM: {body['error']}")
 
-    passed_count = int(body.get("result", "0x0"), 16)
-    assert passed_count == 5, f"Expected 5 passing tests, got {passed_count}"
-    print(f"[TestRunner] Executed all {passed_count}/5 Solidity unit tests in Cancun EVM -> ALL PASSED:")
-    print("  [PASS] testProfitableMorphoLiquidation (with strict balance-delta dust check)")
-    print("  [PASS] testMorphoLiquidationRevertsIfBelowMinProfit")
-    print("  [PASS] testProfitableDutchAuctionWithSlippageGuards")
-    print("  [PASS] testProfitableHarvestBountyAndAllowlistGuard")
-    print("  [PASS] testRevertOnUnauthorizedCallbacks")
+    passed = int(body.get("result", "0x0"), 16)
+    if passed != 5:
+        raise RuntimeError(f"expected 5 passing unit tests, got {passed}")
+
+    status("ok", "unit tests", f"{passed}/5 passed · Cancun EVM", time.perf_counter() - started)
+    _sub_lines(UNIT_TESTS)
 
 
 def run_live_mainnet_fork_tests_on_evm(fork_runtime_bytecode: str, run_fork_selector: str) -> None:
     fork_test_addr = "0x000000000000000000000000000000000000F024"
     caller_addr = "0x000000000000000000000000000000000000CA11"
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "eth_call",
-        "params": [
-            {
-                "from": caller_addr,
-                "to": fork_test_addr,
-                "value": hex(10**16),
-                "data": "0x" + run_fork_selector,
-                "gas": hex(15_000_000),
-            },
-            "latest",
-            {
-                caller_addr: {"balance": hex(10**18)},
-                fork_test_addr: {"code": fork_runtime_bytecode, "balance": hex(10**18)},
-            },
-        ],
-    }
-    req = urllib.request.Request(
-        BASE_RPC_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "User-Agent": "zerro-defi-verifier/1.0"},
+    started = time.perf_counter()
+    body = _eth_call(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "eth_call",
+            "params": [
+                {
+                    "from": caller_addr,
+                    "to": fork_test_addr,
+                    "value": hex(10**16),
+                    "data": "0x" + run_fork_selector,
+                    "gas": hex(15_000_000),
+                },
+                "latest",
+                {
+                    caller_addr: {"balance": hex(10**18)},
+                    fork_test_addr: {"code": fork_runtime_bytecode, "balance": hex(10**18)},
+                },
+            ],
+        }
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        body = json.loads(resp.read().decode("utf-8"))
-
     if "error" in body:
-        raise RuntimeError(f"Live Base Mainnet fork test reverted: {body['error']}")
+        raise RuntimeError(f"live Base fork test reverted: {body['error']}")
 
-    passed_count = int(body.get("result", "0x0"), 16)
-    assert passed_count == 1, f"Expected 1 passing fork test, got {passed_count}"
-    print("[ForkRunner] Executed Live Base Mainnet Fork Integration Test -> PASSED:")
-    print("  [PASS] testLiveMorphoFlashLoanAndUniswapV3Swap (Real Morpho Blue + Real UniV3 WETH/USDC + Real SimpleAccountFactory)")
+    passed = int(body.get("result", "0x0"), 16)
+    if passed != 1:
+        raise RuntimeError(f"expected 1 passing fork test, got {passed}")
+
+    status("ok", "fork test", "1/1 passed · live Base 8453", time.perf_counter() - started)
+    _sub_lines(FORK_TESTS)
 
 
 def compile_executor() -> dict:
@@ -143,6 +186,7 @@ def compile_executor() -> dict:
         },
     }
 
+    started = time.perf_counter()
     proc = subprocess.run(
         [str(solc_bin), "--standard-json"],
         input=json.dumps(standard_json_input).encode("utf-8"),
@@ -170,9 +214,15 @@ def compile_executor() -> dict:
     artifact_path = OUT_DIR / "ZeroCapOmniExecutor.json"
     artifact_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
 
-    print(f"[Compiler] Compiled ZeroCapOmniExecutor -> {artifact_path}")
-    print(f"[Compiler] Creation bytecode size : {len(artifact['bytecode']) // 2 - 1} bytes")
-    print(f"[Compiler] Runtime bytecode size  : {len(artifact['deployedBytecode']) // 2 - 1} bytes")
+    creation_size = len(artifact["bytecode"]) // 2 - 1
+    runtime_size = len(artifact["deployedBytecode"]) // 2 - 1
+    status(
+        "ok",
+        "compile",
+        f"ZeroCapOmniExecutor · {len(sources)} sources · "
+        f"creation {creation_size:,} B · runtime {runtime_size:,} B",
+        time.perf_counter() - started,
+    )
 
     test_data = output["contracts"]["test/ZeroCapOmniExecutor.t.sol"]["ZeroCapOmniExecutorTest"]
     run_solidity_unit_tests_on_evm(
@@ -190,5 +240,38 @@ def compile_executor() -> dict:
     return artifact
 
 
+def main() -> int:
+    ensure_utf8()
+    heading("Zerro-DEFI", "contract build + verification")
+    print()
+    started = time.perf_counter()
+    try:
+        artifact = compile_executor()
+    except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+        status("error", "failed", str(exc)[:220])
+        return 1
+
+    artifact_path = OUT_DIR / "ZeroCapOmniExecutor.json"
+    panel(
+        "ARTIFACT",
+        [
+            ("contract", paint("ZeroCapOmniExecutor", INK)),
+            ("solc", paint(SOLC_VERSION, INK)),
+            ("output", paint(str(artifact_path.relative_to(ROOT_DIR)), INK)),
+            (
+                "bytecode",
+                paint(
+                    f"{(len(artifact['bytecode']) // 2 - 1):,} B creation · "
+                    f"{(len(artifact['deployedBytecode']) // 2 - 1):,} B runtime",
+                    INK,
+                ),
+            ),
+            ("elapsed", paint(f"{time.perf_counter() - started:.1f}s", GREEN)),
+        ],
+        accent=ACCENT,
+    )
+    return 0
+
+
 if __name__ == "__main__":
-    compile_executor()
+    sys.exit(main())

@@ -10,6 +10,7 @@ from .aa import (
     get_account_nonce,
     wait_for_user_op_receipt,
 )
+from . import ui
 from .config import OPERATOR_PRIVATE_KEY, ROOT_DIR, VERIFIED_OUTBOX_FILE
 from .monitor import send_alert
 from .state_store import ExecutionStateStore
@@ -51,22 +52,26 @@ async def reconcile_pending_user_ops(session: aiohttp.ClientSession) -> None:
                 f"Confirmed {op_hash} | Realized=${realized_usd:.4f}",
                 {"tx_hash": tx_hash, "realized_usd": realized_usd},
             )
-            print(
-                f"[Reconciler] Confirmed pending UserOp {op_hash} | Realized: ${realized_usd:.4f} (tx={tx_hash})"
+            ui.log(
+                "reconciler",
+                f"confirmed {op_hash[:16]}… · realized {ui.usd(realized_usd)} · tx {tx_hash[:12]}…",
+                "ok",
             )
             continue
 
         if status != "RECEIPT_TIMEOUT":
             STATE_STORE.record_failure(item["idempotency_key"], status, op_hash)
-            print(f"[Reconciler] Pending UserOp {op_hash} failed: {status}")
+            ui.log("reconciler", f"{op_hash[:16]}… failed: {status}", "error")
             continue
 
         pending_nonce = int(item["nonce"], 16)
         current_nonce = await get_account_nonce(session, item["sender"])
         if current_nonce > pending_nonce:
             STATE_STORE.clear_pending_user_op(op_hash)
-            print(
-                f"[Reconciler] On-chain nonce ({current_nonce}) > pending nonce ({pending_nonce}); cleared {op_hash}."
+            ui.log(
+                "reconciler",
+                f"nonce {current_nonce} > pending {pending_nonce} · cleared {op_hash[:16]}…",
+                "warn",
             )
             continue
 
@@ -80,7 +85,11 @@ async def reconcile_pending_user_ops(session: aiohttp.ClientSession) -> None:
                 f"EXPIRED_AFTER_{item['bump_count']}_BUMPS",
                 op_hash,
             )
-            print(f"[Reconciler] UserOp {op_hash} expired after {item['bump_count']} gas bumps.")
+            ui.log(
+                "reconciler",
+                f"expired after {item['bump_count']} gas bumps · {op_hash[:16]}…",
+                "error",
+            )
             continue
 
         old_max_fee = int(item["max_fee_per_gas"], 16)
@@ -93,8 +102,10 @@ async def reconcile_pending_user_ops(session: aiohttp.ClientSession) -> None:
             STATE_STORE.clear_pending_user_op(op_hash)
             continue
 
-        print(
-            f"[Reconciler] Replacing stuck UserOp {op_hash} on nonce {pending_nonce} (+25% gas bump #{item['bump_count'] + 1})"
+        ui.log(
+            "reconciler",
+            f"replacing stuck {op_hash[:16]}… on nonce {pending_nonce} (+25% bump #{item['bump_count'] + 1})",
+            "warn",
         )
         (
             new_op_hash,
@@ -155,7 +166,7 @@ async def process_verified_outbox() -> None:
 
     is_open, reason = STATE_STORE.is_circuit_open()
     if is_open:
-        print(f"[Submitter] CIRCUIT BREAKER ACTIVE: {reason}")
+        ui.log("submitter", f"circuit breaker active · {reason}", "error")
         return
 
     try:
@@ -172,9 +183,7 @@ async def process_verified_outbox() -> None:
     async with aiohttp.ClientSession() as session:
         await reconcile_pending_user_ops(session)
         if STATE_STORE.has_pending_user_ops():
-            print(
-                "[Submitter] Pending UserOp still in flight; waiting for confirmation to preserve nonce order."
-            )
+            ui.log("submitter", "UserOp in flight · holding nonce order", "warn")
             return
 
         acct_addr = (
@@ -249,9 +258,11 @@ async def process_verified_outbox() -> None:
                     str(realized_raw),
                     realized_usd,
                 )
-                print(
-                    f"[Submitter] {status} | {pipeline} | {desc} | "
-                    f"Sim=${sim_profit_usd:.4f} Realized=${realized_usd:.4f} | UserOp={op_hash} | Tx={tx_hash}"
+                ui.log(
+                    "submitter",
+                    f"{status} · {pipeline} · sim {ui.usd(sim_profit_usd)} "
+                    f"→ realized {ui.usd(realized_usd)} · tx {(tx_hash or 'dry-run')[:12]}…",
+                    "trade" if status == "CONFIRMED" else "ok",
                 )
             elif status == "RECEIPT_TIMEOUT" and op_hash:
                 STATE_STORE.record_pending_user_op(
@@ -268,13 +279,13 @@ async def process_verified_outbox() -> None:
                     profit_decimals,
                     token_price_usd,
                 )
-                print(f"[Submitter] UserOp {op_hash} still pending; queued for reconciliation.")
+                ui.log("submitter", f"{op_hash[:16]}… still pending · queued for reconciliation", "warn")
                 break
             else:
                 STATE_STORE.record_failure(idem_key, status, op_hash)
                 is_open, cb_reason = STATE_STORE.is_circuit_open()
                 if is_open:
                     await send_alert(session, "CIRCUIT_BREAKER_TRIPPED", cb_reason)
-                print(f"[Submitter] FAILED | {pipeline} | {desc} | Reason={status}")
+                ui.log("submitter", f"failed · {pipeline} · {status}", "error")
 
     VERIFIED_OUTBOX_FILE.write_text("[]")

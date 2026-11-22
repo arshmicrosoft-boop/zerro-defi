@@ -7,6 +7,7 @@ import aiohttp
 from eth_abi import decode as abi_decode, encode as abi_encode
 from eth_utils import to_checksum_address
 
+from . import ui
 from .config import (
     BASE_RPC_URLS,
     BEEFY_BASE_VAULTS_API,
@@ -305,7 +306,7 @@ class BaseStateIndexer:
                     }
                 )
         except Exception as e:
-            print(f"[Indexer] Beefy API fetch warning: {e}")
+            ui.log("indexer", f"beefy api warning: {e}", "warn")
         return targets
 
     async def _discover_morpho_borrowers_via_graphql(self, session: aiohttp.ClientSession) -> int:
@@ -643,7 +644,8 @@ class BaseStateIndexer:
             )
         return dutch_targets
 
-    async def update_targets_file(self) -> None:
+    async def update_targets_file(self) -> dict:
+        started = time.perf_counter()
         async with aiohttp.ClientSession() as session:
             harvest_targets, morpho_targets, dutch_targets = await asyncio.gather(
                 self.fetch_beefy_harvest_targets(session),
@@ -660,7 +662,19 @@ class BaseStateIndexer:
             tmp_file = TARGETS_FILE.with_suffix(".tmp")
             tmp_file.write_text(json.dumps(payload, indent=2))
             tmp_file.replace(TARGETS_FILE)
-            print(
-                f"[Indexer] TrackedPos={len(self.tracked_positions)} | Synced {len(morpho_targets)} Morpho (HF<={WATCHLIST_HF_CEILING}), "
-                f"{len(dutch_targets)} Dutch auctions, and {len(harvest_targets)} Beefy vaults -> {TARGETS_FILE.name}"
-            )
+
+        summary = {
+            "morpho": len(morpho_targets),
+            "dutch": len(dutch_targets),
+            "harvest": len(harvest_targets),
+            "tracked": len(self.tracked_positions),
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+        }
+        ui.log(
+            "indexer",
+            f"tracked={summary['tracked']} · morpho={summary['morpho']} "
+            f"(HF<={WATCHLIST_HF_CEILING}) · dutch={summary['dutch']} "
+            f"· harvest={summary['harvest']} · {summary['duration_ms']}ms",
+            "info",
+        )
+        return summary

@@ -29,6 +29,16 @@ targets.json
 verified_outbox.json
 *.log
 logs/
+runtime/
+*.pid
+*.err
+*.tmp
+
+# Local tooling
+.tools/
+contracts/out/
+session-*.md
+session-transcript.md
 
 # OS/IDE
 .DS_Store
