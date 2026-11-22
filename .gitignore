@@ -33,9 +33,7 @@ runtime/
 *.pid
 *.err
 *.tmp
-ops_state.db
-ops_state.db-shm
-ops_state.db-wal
+*.db
 
 # Local tooling
 .tools/
