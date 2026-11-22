@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zerro-orchestrator"
+version = "0.2.0"
+description = "Indexer and ERC-4337 submitter for zero-cap/zero-gas strategies"
+requires-python = ">=3.11"
+dependencies = [
+  "requests>=2.31.0",
+  "python-dotenv>=1.0.1",
+  "eth-account>=0.13.0",
+  "eth-abi>=5.1.0",
+  "eth-utils>=4.1.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["orchestrator*"]
