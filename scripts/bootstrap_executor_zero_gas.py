@@ -118,7 +118,7 @@ async def main() -> int:
             )
             sync_line = (
                 f"{len(allowlist_batch)} targets · {sync_status} · "
-                f"userop {op_hash[:14]}… · tx {tx_hash[:14]}…"
+                f"userop {op_hash[:14]}… · tx {(tx_hash or 'dry-run')[:14]}…"
             )
             status("ok", "allowlist", sync_line)
 
