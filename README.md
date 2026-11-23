@@ -1,476 +1,602 @@
-# Zerro-Defi: $0-Capital / $0-Gas Autonomous MEV & Keeper System (Base Mainnet)
+# Zerro-Defi
 
-**Base Mainnet — Chain ID 8453** | **ERC-4337 Sponsored UserOps** | **Zero Capital Required**
+**A $0-capital / $0-gas autonomous MEV & keeper system for Base Mainnet (chain ID 8453).**
 
----
-
-## 📊 Status
-
-✅ **Verified & Deployment-Ready (Base Mainnet — Chain ID 8453)**
-
-- **Solidity** (`ZeroCapOmniExecutor.sol`): Compiled via `solc v0.8.24 --via-ir` (5/5 Cancun EVM unit tests + 1/1 Live Base Mainnet Fork test passing)
-- **Deterministic CREATE2 Executor Address**: `0x461f3Aa03053605e3d5AE1b09388d7CE360f03a6`
-- **Rust Multicall3 Sniper** (`rust-sniper`): Release build passing with 0 warnings, `<90ms` batch simulation with `stateOverride` bytecode + storage injection
-- **Python Orchestrator** (`py-orchestrator`): Morpho Blue GraphQL + on-chain Multicall3 indexer, Uniswap V3 QuoterV2 routing, ERC-4337 v0.6/v0.7 Sponsored UserOp submitter, SQLite idempotency & circuit breaker
+Three parallel pipelines hunt Morpho Blue liquidations, protocol Dutch auctions, and vault harvest bounties. Opportunities are simulated off-chain for free, and only proven-profitable trades are submitted as ERC-4337 sponsored UserOperations.
 
 ---
 
-## 🏗️ Workflow Architecture Structure
+## Status — Verified, With Honest Caveats
 
-The system operates through a **7-phase workflow engine** that validates every subsystem before execution:
+| Component | State | Evidence |
+|---|---|---|
+| **Solidity executor** | ✅ Compiles, tests pass | `solc v0.8.24 --via-ir` · **5/5** unit tests + **1/1** live-fork test |
+| **Deterministic address** | ✅ Deployed address derivable | CREATE2 → `0x461f3Aa03053605e3d5AE1b09388d7CE360f03a6` |
+| **Rust sniper** | ✅ Clean release build | `cargo build --release` · **0 warnings** · `<90ms` batch sim |
+| **Python orchestrator** | ✅ Runs | Indexer + submitter + monitor, SQLite state |
+| **Live shadow soak** | ⚠️ Ran clean, found nothing | 1.38h · 1,682 cycles · **40,200 sims · 0 verified** |
+| **Dutch pipeline** | ⚠️ **Disabled by default** | `DUTCH_AUCTION_CONTRACTS_JSON=[]` |
+| **Self-funded gas fallback** | ❌ **Not implemented** | Hard-gated on paymaster (see Roadmap) |
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          START.BAT FLOW (8-Preflight)                 │
-│  python 3.11+ check → launch.py exist → .env validate → deps check       │
-│  wallet provision → contract compile → paymaster check → rust build       │
-│           ↓                                                                   │
-│      USER SELECTS MODE (1-4) → launch.py 11-step orchestrator              │
-│           ↓                                                                   │
-│   ALL terminals OR --no-launch OR monitor only OR exit                     │
-└─────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        LAUNCH.PY 11-STEP ORCHESTRATOR                  │
-│  ┌─ preflight  → toolchain + repo layout                                   │
-│  │  env         → read/create .env, resolve DRY_RUN vs LIVE mode           │
-│  │  deps        → pip install, aiohttp availability                        │
-│  │  wallet      → derive operator + executor address                       │
-│  │  compile     → solc build + 5/5 EVM tests + 1 fork test (live Base)   │
-│  │  paymaster   → sponsorship probe (if configured)                      │
-│  │  deploy      → $0-gas CREATE2 deployment of ZeroCapOmniExecutor         │
-│  │  rust        → cargo build --release (0 warnings)                     │
-│  │  launch      → open service terminals (Python indexer + Rust sniper)   │
-│  │  prove       → live capital + sponsorship proof                         │
-│  │  verify      → monitor snapshot + orchestrator config                     │
-└─────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        THREE STRATEGY PIPELINES                         │
-│                                                                           │
-│  Pipeline A — Morpho Blue Micro-Liquidations                              │
-│  │  Scans active borrowers via GraphQL + on-chain logs                     │
-│  │  Accrues IRM Taylor-series interest                                    │
-│  │  Quotes collateral swaps across Uniswap V3 pools                        │
-│  │  Liquidates via onMorphoLiquidate with $0 upfront capital               │
-│                                                                           │
-│  Pipeline B — Dutch Auction Fee-Burner                                    │
-│  │  Flash-borrows payment tokens from Morpho Blue (0.00% fee)              │
-│  │  Clears decaying protocol auctions                                     │
-│  │  Swaps reward tokens with slippage guards                               │
-│  │  Repays Morpho, sweeps net profit                                       │
-│                                                                           │
-│  Pipeline C — Beefy Vault Harvest Bounties                                │
-│  │  Simulates harvest(address) across Base Beefy strategies                │
-│  │  Claims WETH call rewards when bounty > MIN_PROFIT_USD                  │
-│  │  Uses Multicall3.tryAggregate for batch claims                          │
-└─────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        PAYMASSER & GAS FLOW                               │
-│                                                                           │
-│  1. UserOp signing: Off-chain ECDSA math → $0 ETH cost for your EOA        │
-│  2. Bundler pays L2 gas on Base (~$0.0005 - $0.005 per UserOp)              │
-│  3. Paymaster reimburses bundler via EntryPoint contract                    │
-│  4. Your EOA balance: $0.00 required for gas (if paymaster configured)      │
-│  5. Fallback: $5 ETH covers ~10-15 UserOps if paymaster unavailable         │
-│                                                                           │
-│  QUOTA OVERVIEW (Base Mainnet):                                             │
-│  Provider       Free Tier    Paid Tier    Notes                             │
-│  Coinbase CDP   100/day      Custom       Most popular, reliable            │
-│  Pimlico        50/day       $10/mo 500/day  Good docs, active             │
-│  Alchemy Builder 25/day      $25/mo     Good for dev                      │
-│  ZeroDev        10/day       $15/mo     Newer, growing                   │
-└─────────────────────────────────────────────────────────────────────────┘
+> **The headline number nobody should skip:** in the recorded soak, the system simulated **40,200 opportunities and verified zero**. That is *correct behavior*, not a bug — it means the safety gate refused to fire on unprofitable or stale state. But it also means **this is a low-frequency, event-driven system**, not a money printer. Read [Earnings Estimates](#earnings-estimates) before funding anything.
 
 ---
 
-## ⚙️ How It Works
+## ⚠️ Read This First
 
-### The Complete Execution Flow
+**What this is:**
+- A genuinely **$0-upfront-capital** system (Morpho flash loans + permissionless bounty calls).
+- A genuinely **$0-gas** system **while a paymaster sponsors you**.
+- A **fail-closed** system: no simulation pass → no submission → no spend.
 
-```mermaid
-flowchart TD
-    A[Double-click start.bat] --> B{Python 3.11+?}
-    B -->|No| C[Exit with error]
-    B -->|Yes| D{launch.py exists?}
-    D -->|No| C
-    D -->|Yes| E[Step 1: Environment Validation]
-    E --> F{.env exists?}
-    F -->|No| G[Create from .env.example]
-    F -->|Yes| H[Check PAYMASTER_BUNDLER_RPC]
-    H --> I{Paymaster configured?}
-    I -->|Yes| J[LIVE mode]
-    I -->|No| K[DRY_RUN mode]
-    J --> L[Step 2: Dependency Check]
-    K --> L
-    L --> M[Step 3: Wallet Check]
-    M --> N[Step 4: Contract Compile + 5/5 Tests]
-    N --> O[Step 5: Paymaster & Deployment Check]
-    O --> P[Step 6: Rust Sniper Build]
-    P --> Q[Step 7: Launch Decision Point]
-    Q -->|Choice 1| R[Launch ALL terminals]
-    Q -->|Choice 2| S[Launch --no-launch (BAT scripts only)]
-    Q -->|Choice 3| T[Monitor only]
-    Q -->|Choice 4| U[Exit]
-    R --> V[launch.py 11 steps: preflight→prove→verify]
-    S --> V
-    T --> W[python -m orchestrator.monitor --once]
-    V --> X[11 steps execute: env→deps→wallet→compile→paymaster→deploy→rust→launch→prove→verify]
-    W --> Y[Monitor snapshot + config]
+**What this is not:**
+- Not a high-frequency arbitrage bot. Paymaster latency (150–350ms) makes it lose every latency race.
+- Not audited. The contract is hardened but has **not** had an independent security review.
+- Not profitable on demand. Expect **sparse, clustered** wins (see estimates).
+- Not "free forever." It depends on a paymaster you do not control.
+
+---
+
+## Architecture
+
+```text
+                        Base Mainnet RPC / WebSocket
+                                    │
+              ┌─────────────────────┴─────────────────────┐
+              │                                           │
+              ▼                                           ▼
+   ┌──────────────────────┐   targets.json    ┌──────────────────────────┐
+   │  Python Indexer      │──────────────────▶│  Rust Sniper Engine      │
+   │  (py-orchestrator)   │                   │  (rust-sniper)           │
+   │                      │◀──────────────────│                          │
+   │  • Morpho borrowers  │   health/metrics  │  • 500ms block poll      │
+   │  • Beefy strategies  │                   │  • 3 parallel pipelines  │
+   │  • Auction targets   │                   │  • Multicall3 simulate   │
+   │  • HF ≤ 1.08 filter  │                   │  • stateOverride calls   │
+   └──────────┬───────────┘                   └────────────┬─────────────┘
+              │                                            │
+              │  re-index every 60s                        │ verified_outbox.json
+              │                                            ▼
+              │                            ┌──────────────────────────────┐
+              └───────────────────────────▶│  Python AA Submitter         │
+                                           │  • build UserOp              │
+                                           │  • request sponsorship       │
+                                           │  • sign userOpHash (off-chain)│
+                                           │  • eth_sendUserOperation     │
+                                           │  • receipt + nonce tracking  │
+                                           └──────────────┬───────────────┘
+                                                          │ sponsored UserOp
+                                                          ▼
+                                           ┌──────────────────────────────┐
+                                           │  EntryPoint v0.6 + Paymaster │
+                                           └──────────────┬───────────────┘
+                                                          │ call
+                                                          ▼
+                                           ┌──────────────────────────────┐
+                                           │  ZeroCapOmniExecutor.sol     │
+                                           │  • flash-borrow from Morpho  │
+                                           │  • liquidate / buy / harvest │
+                                           │  • swap via Uniswap V3       │
+                                           │  • repay + assert profit     │
+                                           │  • sweep surplus to owner    │
+                                           └──────────────────────────────┘
 ```
 
-### Pipeline Details
+### Component responsibilities
 
-#### Pipeline A — Morpho Blue Micro-Liquidations
-1. **GraphQL scan**: Query Morpho Blue subgraph for active borrowers
-2. **Interest accrual**: Compute IRM Taylor-series interest per block
-3. **Health factor check**: Identify borrowers with HF ≤ 1.08 (unhealthy)
-4. **Swap quoting**: Quote collateral swaps across Uniswap V3 `[100, 500, 3000, 10000]` bps pools
-5. **Liquidation**: Execute `onMorphoLiquidate` via ERC-4337 UserOp
-6. **Profit**: Net after swap haircut (0.5% via QuoterV2) and simulation gas
-
-#### Pipeline B — Dutch Auction Fee-Burner
-1. **Auction scanning**: Monitor protocol fee-burner auctions on Base
-2. **Flash-borrow**: Borrow payment tokens via Morpho Blue (0.00% fee)
-3. **Clear auction**: Bid to clear decaying auction, receive reward tokens
-4. **Swap execution**: Swap reward tokens with `minAmountsOut[]` slippage guards
-5. **Repay**: Repay Morpho Blue flash-borrow
-6. **Profit**: Net after gas + swap fees
-
-#### Pipeline C — Beefy Vault Harvest Bounties
-1. **Strategy scanning**: Index active Beefy vault strategies on Base
-2. **Bounty check**: Simulate `harvest(address)` for each strategy
-3. **Reward claim**: Claim native `WETH` call rewards when bounty > `MIN_PROFIT_USD` (default: $0.05)
-4. **Batch aggregation**: Use `Multicall3.tryAggregate` for efficient claims
-5. **Profit**: Full bounty amount (gas is sponsored via paymaster)
-
-### The $0-Gas Mechanism
-
-| Step | Cost | Who Pays |
-|------|------|----------|
-| UserOp signing | $0.00 | Off-chain ECDSA math (your EOA) |
-| Bundler submission | $0.00 - $0.005 | ERC-4337 Bundler (Base L2) |
-| Gas reimbursement | $0.00 | Paymaster (Coinbase CDP / Pimlico) |
-| Your EOA gas | $0.00 | **None required** (if paymaster configured) |
-| Fallback ETH | ~$0.05-0.50 per 10 UserOps | Your EOA (if no paymaster) |
+| Component | Language | Responsibility |
+|---|---|---|
+| `py-orchestrator/orchestrator/indexer.py` | Python | Builds `targets.json` — Morpho borrowers, Beefy strategies, Dutch auctions |
+| `rust-sniper/src/*` | Rust | Polls blocks, runs 3 pipelines, simulates via `Multicall3.tryAggregate` |
+| `py-orchestrator/orchestrator/submitter.py` | Python | Consumes `verified_outbox.json`, drives UserOp lifecycle |
+| `py-orchestrator/orchestrator/aa.py` | Python | ERC-4337: build, sponsor, sign, send UserOp |
+| `py-orchestrator/orchestrator/state_store.py` | Python | SQLite idempotency + circuit breaker |
+| `contracts/src/ZeroCapOmniExecutor.sol` | Solidity | On-chain execution with profit assertion |
+| `scripts/launch.py` | Python | 11-step orchestrator for setup + launch |
+| `start.bat` | Batch | Double-click entry point with 8-step preflight |
 
 ---
 
-## 📈 Monthly Income Estimates (Corrected Math)
+## How It Works — The Runtime Workflow
 
-**Based on realistic execution frequency: 1-5 successful on-chain wins per day**
+### The loop, step by step
 
-| Strategy | Profit Per Win | Conservative Weekly | **Realistic Weekly** | **Bullish Weekly** | Conservative Monthly | **Realistic Monthly** | Bullish Monthly |
-|----------|---------------|---------------------|----------------------|--------------------|----------------------|----------------------|-----------------|
-| **Morpho Micro-Liquidations** | $0.50 – $6.00 (avg $2.10) | $6.00 | **$16.80** (≈8 wins) | $45.00+ | $24.00 | **$72.00** | $180.00+ |
-| **Vault Harvest Bounties** | $0.06 – $0.30 (avg $0.12) | $1.50 | **$2.40** (≈20 wins) | $3.50 | $6.00 | **$9.60** | $14.00 |
-| **Dutch Auction Fee-Burner** | $0.15 – $1.20 (avg $0.40) | $0.00* | **$2.80** (≈7 wins) | $6.00 | $0.00* | **$11.20** | $24.00 |
-| **TOTAL** | **Weighted avg: ~$0.63/win** | **$7.50 / week** | **~$22.00 / week** | **~$54.50+ / week** | **$30.00 / month** | **~$88.00 / month** | **~$218.00 / month** |
+1. **Index** (`indexer.py`, every `SYNC_INTERVAL_SECONDS` = 60s)
+   - Pulls Morpho Blue borrow logs → tracks up to **250** positions, keeps those with **health factor ≤ 1.08**.
+   - Queries the Beefy subgraph → up to **80** active harvest targets.
+   - Reads `DUTCH_AUCTION_CONTRACTS_JSON` → **empty by default**.
+   - Writes `targets.json`.
 
-\* *Pipeline 3 (Dutch Auctions) produces $0.00/week if `DUTCH_AUCTION_CONTRACTS_JSON` in `.env` is left empty `[]`. Once populated with 5–10 active Base fee-burner/auction contracts, it adds ~$2–$6/week.*
+2. **Simulate** (`rust-sniper`, every `BLOCK_POLL_MS` = 500ms)
+   - Runs all three pipelines concurrently against `targets.json`.
+   - Each candidate is simulated via `Multicall3.tryAggregate` with `stateOverride`, so the **undeployed** executor can be tested for free.
+   - Gate: `passed == true` **and** `profit_usd >= MIN_PROFIT_USD` (default **$0.05**).
+   - Survivors are written to `verified_outbox.json`.
 
-### Annual Projection (30x weekly)
+3. **Submit** (`submitter.py`, checked every 500ms)
+   - Deduplicates against SQLite (`strategy, target, block, calldata` hash).
+   - Circuit breaker check: **5 consecutive failures → 600s cooldown**.
+   - Builds a UserOp, requests paymaster sponsorship, signs the `userOpHash` off-chain (ECDSA — no gas).
 
-| Tier | Annual Income |
-|------|---------------|
-| Conservative | $1,365 |
-| Realistic | $4,095 |
-| Bullish | $8,125+ |
+4. **Execute** (on-chain)
+   - EntryPoint validates the sponsored UserOp and calls the executor.
+   - Executor flash-borrows from Morpho (0% fee), executes, repays, then **reverts unless `balanceAfter - balanceBefore >= minProfit`**.
+   - Surplus is swept to the owner (your `SimpleAccount`).
 
-### Key Variables Affecting Income
+5. **Record** — outcome written to SQLite; monitor dashboard updates every 500ms.
 
-| Variable | Impact | Control Level |
-|----------|--------|---------------|
-| **Market volatility** | High vol → more liquidations, more opportunities | Medium (market-driven) |
-| **Paymaster quota** | Stricter quota → fewer UserOps/day | High (provider choice) |
-| **MIN_PROFIT_USD threshold** | Higher threshold → fewer but larger wins | High (configurable) |
-| **Strategy mix** | More pipelines → more weekly wins | High (you choose) |
-| **Oracle ticks** | Chainlink updates create liquidation windows | Low (random) |
+### Timing budget (why this only wins slow-decay opportunities)
 
----
+| Stage | Typical latency | Consequence |
+|---|---|---|
+| Target read | <1 ms | negligible |
+| Simulation RPC | 20–150 ms | depends on RPC provider |
+| **Paymaster sponsorship** | **150–350 ms** | **loses oracle-race strategies** |
+| Bundler inclusion | 1+ block (~2s on Base) | depends on fees/policy |
 
-## ⚠️ Things That Might Go Wrong (Failure Modes)
-
-| Failure Mode | Symptoms | Mitigation |
-|--------------|----------|------------|
-| **Paymaster rate-limited** | `429 Too Many Requests`, UserOps revert | Pause 24h, switch provider (Pimlico → Coinbase CDP) |
-| **No profitable opportunities** | 0 verified trades after many cycles | Wait for oracle ticks, reduce MIN_PROFIT_USD threshold |
-| **Circuit breaker tripped** | `600s cooldown`, no executions for 10min | Check `failures.txt` in repo root, reset if needed |
-| **Stale targets** | Opportunities > 300s old are rejected | Ensure scanner runs frequently, extend TTL if needed |
-| **Contract compilation fails** | `solc error`, test failures | Run `python scripts/compile_and_verify.py` manually, check solc version |
-| **Wallet key invalid** | `Account.from_key fails`, address derivation error | Regenerate key, ensure 65-char 0x-prefixed private key |
-| **Rust build warnings** | `cargo build --release` shows warnings | Review warnings, usually harmless but fix if related to simulation |
-| **`.env` missing or malformed** | `PAYMASTER_BUNDLER_RPC` not found, DRY_RUN stuck | Re-run `python scripts/setup.py` to reconfigure |
-| **Network disconnected** | RPC timeouts, submission failures | Use reliable endpoint (Alchemy/Infura as backup), check internet |
-| **Executor not deployed** | `deploy` step skipped in DRY_RUN, no on-chain address | Deploy via `python scripts/bootstrap_executor_zero_gas.py` after paymaster config |
-| **SQLite dedup issues** | Same opportunity executed twice | Database auto-clears on restart, manual `rm state.db` if stuck |
-
-### Common User Errors
-
-1. **Forgetting to set `DRY_RUN=false`** after paymaster config → system runs in simulation mode only
-2. **Leaving `DUTCH_AUCTION_CONTRACTS_JSON` empty** → Pipeline 3 produces $0.00/week
-3. **Setting `MIN_PROFIT_USD` too high** → 0 opportunities found, no executions
-4. **Not funding EOA with any ETH** → Without paymaster, all UserOps fail (but with paymaster: $0 required)
-5. **Double-clicking start.bat while another instance runs** → SQLite lock error, wait 5min and retry
+> This is the core strategic constraint: **anything a fast searcher can snipe in <100ms is not winnable here.** The system targets *ignored*, *slow-decaying* opportunities instead.
 
 ---
 
-## ⚖️ Pros and Cons
+## The Three Strategies
 
-### ✅ Pros
+### Pipeline A — Morpho Blue micro-liquidations
+- **Capital:** $0 (Morpho flash loan, 0% fee).
+- **Trigger:** tracked borrower with HF ≤ 1.08 and a profitable liquidation path.
+- **Flow:** flash-borrow loan token → `liquidate` → swap seized collateral to loan token via Uniswap V3 → repay → sweep surplus.
+- **Pay per win:** **$0.50 – $6.00** (avg ~$2.10) — Morpho pays a 4–7% liquidation incentive, so bigger positions pay more.
+- **Frequency:** event-driven. Clusters during volatile markets; near-zero on flat days.
 
-| Category | Detail |
-|----------|--------|
-| **Capital** | $0.00 required to start (flash loans are zero-interest) |
-| **Gas** | $0.00 per UserOp with ERC-4337 paymaster sponsorship |
-| **Risk** | No token approvals required, executor never holds balances |
-| **Automation** | Fully autonomous once configured (3 pipelines running in parallel) |
-| **Transparency** | All 6 EVM tests + 1 fork test pass before deployment |
-| **Transparency** | Rust sniper: `<90ms` batch simulation, 0 warnings in release build |
-| **Monitoring** | Live dashboard via `python -m orchestrator.monitor --once` |
-| **Fail-closed** | Circuit breaker trips after 5 consecutive failures (600s cooldown) |
-| **Idempotency** | SQLite dedup ensures no double-execution of same opportunity |
+### Pipeline B — Protocol fee-burner Dutch auctions
+- **Capital:** $0 (Morpho flash loan).
+- **Trigger:** an active auction where the decaying price beats gas + swap cost.
+- **Flow:** flash-borrow payment token → `buy(...)` → swap reward token with per-asset `minAmountsOut[]` guards → repay → sweep.
+- **Pay per win:** **$0.15 – $1.20** (avg ~$0.40).
+- **⚠️ Status:** **ships disabled.** `DUTCH_AUCTION_CONTRACTS_JSON=[]` by default. You must add live auction contracts to activate it. This is the cheapest profit you are currently leaving on the table.
 
-### ⚠️ Cons / Limitations
-
-| Category | Detail |
-|----------|--------|
-| **Paymaster dependency** | Sponsorship can be rate-limited or revoked (free tiers have quotas) |
-| **Market-spiky** | Opportunities are event-driven (4-8 hrs dry, then 3-5 wins in 2 blocks) |
-| **No audit** | Smart contract hardened but not professionally audited (8/10 security score) |
-| **Base Mainnet only** | Limited to Base L2 ecosystem (not multi-chain) |
-| **RPC requirement** | Need reliable Base Mainnet JSON-RPC endpoint |
-| **Learning curve** | Requires understanding of ERC-4337, Morpho Blue, Beefy Vaults |
-| **Monthly variance** | Conservative: $15-35/week; Bullish: $70-100+/week (depends on market) |
-| **Technical debt** | Active development, APIs and ABIs may change between versions |
-
-### 📊 Comparison: Paymaster vs Own Gas
-
-| Feature | Paymaster (Recommended) | $5 ETH Only (No Paymaster) |
-|---------|------------------------|----------------------------|
-| **Upfront cost** | $0.00 | $5.00 (one-time) |
-| **Gas per UserOp** | $0.00 (sponsored) | ~$0.05-0.15 per UserOp |
-| **Max attempts** | Unlimited (quota-dependent) | ~10-15 UserOps before ETH depleted |
-| **Monthly profit** | $65-150 (net) | -$5.00 (lose the $5 funding) |
-| **Risk** | Paymaster can revoke | Lose $5 ETH if market moves against you |
-| **Best for** | Long-term production, serious income | Short-term testing, learning |
+### Pipeline C — Vault harvest bounties
+- **Capital:** $0 (permissionless `harvest()` call).
+- **Trigger:** Beefy strategy where `callReward()` ≥ `MIN_PROFIT_USD`.
+- **Flow:** call `harvest(address)` → claim native WETH bounty.
+- **Pay per win:** **$0.06 – $0.30** (avg ~$0.12) — on Base L2, gas is cheap enough that keepers harvest bounties almost immediately, so they rarely grow large.
+- **Frequency:** highest of the three (~80 targets), but smallest per-win.
 
 ---
 
-## 🚀 Full Guide: How to Use (Click start.bat)
+## Repository Structure
 
-### Option 1: Double-Click start.bat (Recommended for first-time setup)
-
-**1. Prerequisites:**
-- Windows OS (or WSL on Linux/macOS)
-- Python 3.11+ installed
-- Git installed (for repository access)
-
-**2. First Run:**
-- Navigate to `C:\Users\ez\desktop\bots\zerro-defi`
-- **Double-click** `start.bat`
-- A command window opens showing preflight validation steps
-
-**3. Preflight Validation (8 automatic checks):**
-```
-[OK] Python 3.12+ detected.
-[OK] Launch script found.
-[INFO] .env exists
-[STEP 2] Dependency Check
-[OK] Python dependencies satisfied.
-[STEP 3] Wallet Check
-[OK] Operator wallet validated.
-[STEP 4] Contract Compilation Check
-[OK] Contracts compiled & 5/5 tests + 1 fork test PASSED
-[STEP 5] Paymaster & Deployment Check
-[INFO] Paymaster configured - deployment available
-[STEP 6] Rust Sniper Build Check
-[OK] Rust build clean (0 warnings)
+```text
+zerro-defi/
+├── start.bat                     ← double-click entry point (8-step preflight)
+├── .env.example                  ← configuration template
+├── ARCHITECTURE.md               ← deep design doc
+├── OVERNIGHT_REPORT.md           ← recorded soak evidence
+├── README.md
+├── contracts/
+│   ├── foundry.toml
+│   ├── src/
+│   │   ├── ZeroCapOmniExecutor.sol
+│   │   └── interfaces/{IERC20,IMorphoBlue,ISwapRouter}.sol
+│   └── test/
+│       ├── ZeroCapOmniExecutor.t.sol        (5 unit tests)
+│       └── ZeroCapMainnetFork.t.sol         (1 fork test)
+├── py-orchestrator/
+│   └── orchestrator/
+│       ├── main.py               ← runtime loop
+│       ├── config.py             ← env parsing
+│       ├── indexer.py            ← targets.json builder
+│       ├── submitter.py          ← outbox consumer
+│       ├── aa.py                 ← ERC-4337 build/sponsor/sign/send
+│       ├── state_store.py        ← SQLite idempotency + circuit breaker
+│       ├── monitor.py            ← telemetry dashboard
+│       └── ui.py                 ← terminal UI toolkit
+├── rust-sniper/
+│   └── src/
+│       ├── main.rs               ← block poll loop
+│       ├── config.rs             ← env parsing
+│       ├── sim.rs                ← Multicall3 + stateOverride simulation
+│       └── pipelines/{morpho,dutch,harvest}.rs
+├── scripts/
+│   ├── launch.py                 ← 11-step orchestrator
+│   ├── setup.py                  ← interactive setup wizard
+│   ├── compile_and_verify.py     ← solc + 6 tests
+│   ├── setup_operator_wallet.py  ← key + CREATE2 address
+│   ├── bootstrap_executor_zero_gas.py
+│   ├── test_paymaster_integration.py
+│   ├── withdraw_profits_zero_gas.py
+│   ├── prove_zero_cap_zero_gas.py
+│   ├── run_live_shadow_cycle.py
+│   ├── soak_telemetry.py
+│   └── estimate_royale.py        ← ROI model
+└── ops/runbook.md
 ```
 
-**4. Launch Menu Appears:**
-```
-============================================================
-   PREFLIGHT COMPLETE - READY TO LAUNCH
-============================================================
+---
 
- Configuration Summary:
-  - Mode: LIVE (or DRY_RUN)
-  - Paymaster: 1 (1=yes, 0=no)
-  - Deployable: 1
-  - Rust Sniper: Built & ready
-  - Contracts: Compiled & verified
-  - Wallet: Provisioned
+## Quick Start
 
- Select launch option:
-  1) Launch ALL terminals (DRY_RUN or LIVE)
-  2) Launch terminals --no-launch (write BAT scripts only)
-  3) Run monitor only
-  4) Exit without launching
+### The 30-second version
 
- Enter choice [1-4]:
-```
+> **Double-click `start.bat`.**
+>
+> It runs 8 preflight checks (Python, `.env`, deps, wallet, contracts, paymaster, Rust build) and then asks which mode to launch. If anything is broken, it tells you exactly what and refuses to launch.
 
-**5. Choose Your Option:**
-- **1) Launch ALL terminals** — Starts 3 terminals:
-  - Terminal 1: Python Indexer + ERC-4337 Submitter
-  - Terminal 2: Rust Multicall3 Sniper
-  - Terminal 3: Telemetry Dashboard (run anytime)
-- **2) Launch --no-launch** — Writes BAT scripts only, does NOT auto-start terminals
-- **3) Monitor only** — Runs `python -m orchestrator.monitor --once` (snapshot + config check)
-- **4) Exit** — Exits without launching anything
-
-**6. Monitoring:**
-- After launching, check status: `python -m orchestrator.monitor --once`
-- View verified trades and weekly income in the dashboard
-- Stop all: Close all terminal windows
+That's genuinely it. Everything below is the detailed version.
 
 ---
 
-### Option 2: Command-Line Setup (Advanced)
+### The full guide (first-time setup)
 
-**1. Configure Paymaster:**
+#### Step 0 — Prerequisites
+
+| Requirement | Version | Check |
+|---|---|---|
+| Python | 3.11+ | `python --version` |
+| Rust + Cargo | stable | `cargo --version` |
+| Git | any | `git --version` |
+
+#### Step 1 — Clone and configure
+
 ```powershell
-# Set your free Base Mainnet paymaster endpoint
-Set-Content .env -Value "PAYMASTER_BUNDLER_RPC=https://api.developer.coinbase.com/rpc/v1/base/YOUR_KEY`nDRY_RUN=false"
+git clone https://github.com/arshmicrosoft-boop/zerro-defi.git
+cd zerro-defi
+copy .env.example .env
 ```
 
-**2. Test Paymaster Connection:**
-```powershell
-python scripts/test_paymaster_integration.py
-```
-- Output "sponsored · gas covered" → Good to go
-- Output "rejected" → Try different provider (Pimlico vs Coinbase CDP)
+#### Step 2 — Get a free paymaster (required for live execution)
 
-**3. Deploy Executor (Live mode only):**
-```powershell
-python scripts/bootstrap_executor_zero_gas.py
-```
+Register for a Base Mainnet ERC-4337 bundler/paymaster:
 
-**4. Launch System:**
-```powershell
-# Terminal 1: Orchestrator (indexer + submitter)
-cd py-orchestrator && python -m orchestrator.main
+- **Coinbase CDP** — https://portal.cdp.coinbase.com
+- **Pimlico** — https://dashboard.pimlico.io
 
-# Terminal 2: Rust Sniper
-cd rust-sniper && cargo run --release
+Then in `.env`:
 
-# Terminal 3: Telemetry Dashboard
-cd py-orchestrator && python -m orchestrator.monitor
+```env
+PAYMASTER_BUNDLER_RPC=https://api.developer.coinbase.com/rpc/v1/base/YOUR_KEY
+DRY_RUN=false
 ```
 
----
+> **Without this, the bot runs in simulation-only mode.** Live submission is hard-gated on a paymaster existing (`aa.py:411`).
 
-### Option 3: Interactive Wizard (First-time only)
+#### Step 3 — Interactive setup wizard
 
-**1. Run setup wizard:**
-```powershell
-python scripts/setup.py --yes
-```
-or interactively:
 ```powershell
 python scripts/setup.py
 ```
 
-**2. Wizard guides you through:**
-- Step 1: Gas strategy (Paymaster vs Own gas)
-- Step 2: Wallet configuration (paste your 0x private key)
-- Step 3: Deploy executor (requires paymaster + funded wallet)
-- Step 4: Final status + next steps panel
+Walks you through: gas strategy → private key → executor deployment. Non-interactive mode: `python scripts/setup.py --yes`.
 
-**3. After wizard completes:**
-- `.env` is configured with all required variables
-- Operator wallet is derived and saved
-- You can then run `start.bat` for preflight + launch menu
+#### Step 4 — Verify everything
+
+```powershell
+python scripts/compile_and_verify.py     # solc + 5 unit + 1 fork test
+python scripts/test_paymaster_integration.py
+python scripts/setup_operator_wallet.py
+```
+
+#### Step 5 — Deploy the executor ($0 gas)
+
+```powershell
+python scripts/bootstrap_executor_zero_gas.py
+```
+
+Deploys via CREATE2 to `0x461f3Aa03053605e3d5AE1b09388d7CE360f03a6` using a sponsored UserOp. Requires the paymaster from Step 2.
+
+#### Step 6 — Launch
+
+```powershell
+start.bat
+```
+
+Or manually, in three terminals:
+
+```powershell
+# Terminal 1 — orchestrator
+cd py-orchestrator && python -m orchestrator.main
+
+# Terminal 2 — sniper
+cd rust-sniper && cargo run --release
+
+# Terminal 3 — monitor
+cd py-orchestrator && python -m orchestrator.monitor
+```
+
+#### Step 7 — Withdraw profits
+
+```powershell
+python scripts/withdraw_profits_zero_gas.py
+```
+
+Sweeps USDC/WETH from your `SimpleAccount` to your wallet via a $0-gas UserOp.
 
 ---
 
-### 🛡️ Safety Checklist Before Live Execution
+## `start.bat` — What It Actually Checks
 
-- [ ] **Paymaster configured** in `.env` (`PAYMASTER_BUNDLER_RPC` set)
-- [ ] **`DRY_RUN=false`** set in `.env` (for live execution)
-- [ ] **Paymaster tested**: `python scripts/test_paymaster_integration.py` returns "sponsored"
-- [ ] **Executor deployed**: `python scripts/bootstrap_executor_zero_gas.py` ran successfully
-- [ ] **Contracts compiled**: `python scripts/compile_and_verify.py` → 5/5 tests + 1 fork pass
-- [ ] **Rust sniper built**: `cargo build --release` shows 0 warnings
-- [ ] **Wallet validated**: `python scripts/setup_operator_wallet.py` passes
-- [ ] **Circuit breakers set**: Understand 5-failure → 600s cooldown behavior
-- [ ] **MIN_PROFIT_USD threshold**: Reasonable value (default $0.05, adjust as needed)
-- [ ] **DUTCH_AUCTION_CONTRACTS_JSON**: Populated if using Pipeline 3 (or leave `[]` for $0.00/week)
+Preflight runs **before** any launch, and **fails closed**:
 
----
+| # | Check | On failure |
+|---|---|---|
+| 1 | Python ≥ 3.11 | Abort with install link |
+| 2 | `scripts\launch.py` exists | Abort, suggest `git pull` |
+| 3 | `.env` exists (creates from example) | Abort if no template |
+| 4 | `PAYMASTER_BUNDLER_RPC` set | Falls back to DRY_RUN mode |
+| 5 | `aiohttp` installed (auto-installs) | Abort on pip failure |
+| 6 | Operator wallet valid | Warn, continue |
+| 7 | Contracts compile + 6 tests pass | **Abort** |
+| 8 | `cargo build --release` clean | Warn on warnings |
 
-## 📜 Documentation & Scripts Reference
-
-| Script | Purpose | Usage |
-|--------|---------|-------|
-| `scripts/compile_and_verify.py` | solc compile + 5 EVM tests + 1 fork test | `python scripts/compile_and_verify.py` |
-| `scripts/setup_operator_wallet.py` | Generate EOA key + deterministic CREATE2 address | `python scripts/setup_operator_wallet.py` |
-| `scripts/bootstrap_executor_zero_gas.py` | Deploy ZeroCapOmniExecutor via $0-gas CREATE2 | `python scripts/bootstrap_executor_zero_gas.py` |
-| `scripts/test_paymaster_integration.py` | Verify sponsorship before live execution | `python scripts/test_paymaster_integration.py` |
-| `scripts/withdraw_profits_zero_gas.py` | Sweep USDC/WETH from SimpleAccount to your wallet | `python scripts/withdraw_profits_zero_gas.py` |
-| `scripts/prove_zero_cap_zero_gas.py` | Live proof: Morpho liquidity + sponsored ops | `python scripts/prove_zero_cap_zero_gas.py` |
-| `scripts/run_live_shadow_cycle.py` | Read-only shadow mode (no transactions) | `python scripts/run_live_shadow_cycle.py` |
-| `scripts/launch.py` | Full 11-step interactive launcher | `python scripts/launch.py --live --yes` |
-| `start.bat` | Double-click-friendly UTF-8 wrapper with preflight | `start.bat` (double-click or `cmd /c start.bat`) |
-| `scripts/setup.py` | Interactive wizard for gas strategy/wallet/deployment | `python scripts/setup.py --yes` |
-| `scripts/estimate_royale.py` | ROI estimation with corrected weekly income $15-35 | `python scripts/estimate_royale.py` |
+Then it presents a menu: **1)** launch all terminals · **2)** write service scripts only · **3)** monitor only · **4)** exit.
 
 ---
 
-## ⚠️ Safety Invariants
+## `launch.py` — The 11 Steps
 
-| Invariant | Mechanism |
-|-----------|-----------|
+Run a subset with `--only`, or list them with `--list`.
+
+```powershell
+python scripts/launch.py --only preflight,env,compile --skip-build --no-launch
+```
+
+| Step | Does |
+|---|---|
+| `preflight` | Toolchain + repo layout |
+| `env` | Read/create `.env`, resolve mode |
+| `deps` | Install Python packages |
+| `wallet` | Derive operator + executor address |
+| `compile` | solc build + 5 EVM tests + fork test |
+| `paymaster` | Sponsorship probe |
+| `deploy` | $0-gas CREATE2 deployment |
+| `rust` | `cargo build --release` |
+| `launch` | Open service terminals |
+| `prove` | Live capital + sponsorship proof |
+| `verify` | Monitor snapshot + config check |
+
+---
+
+## Configuration Reference
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BASE_RPC_URL` | publicnode | HTTP RPC |
+| `BASE_WS_URL` | publicnode | WebSocket RPC |
+| `CHAIN_ID` | `8453` | Base Mainnet |
+| `ENTRYPOINT_ADDRESS` | `0x5FF1...2789` | ERC-4337 v0.6 EntryPoint |
+| `SIMPLE_ACCOUNT_FACTORY` | `0x9406...6454` | SimpleAccount factory |
+| `PAYMASTER_BUNDLER_RPC` | — | **Required for live** |
+| `OWNER_EOA_PRIVATE_KEY` / `OPERATOR_PRIVATE_KEY` | — | Signing key (never commit) |
+| `EXECUTOR_ADDRESS` | — | Your deployed executor |
+| `MORPHO_BLUE_ADDRESS` | `0xBBBB...FFCb` | Morpho Blue |
+| `UNISWAP_ROUTER_ADDRESS` | `0x2626...e481` | SwapRouter02 |
+| `WETH_ADDRESS` | `0x4200...0006` | WETH |
+| `MIN_PROFIT_WEI` | `15000000000000` | ~0.000015 WETH floor |
+| `MIN_PROFIT_USD` | `0.05` | Sniper profit gate |
+| `MAX_GAS_PER_OP` | `900000` | Per-op gas cap |
+| `SYNC_INTERVAL_SECONDS` | `60` | Indexer cadence |
+| `BLOCK_POLL_MS` | `500` | Sniper poll cadence |
+| `DUTCH_AUCTION_CONTRACTS_JSON` | `[]` | **Pipeline B is off until set** |
+| `DRY_RUN` | `true` | Must be `false` for live |
+
+---
+
+## Earnings Estimates
+
+> These are **model estimates**, not measured results. The only measured figure is the soak: 0 verified opportunities in 1.38h. Per-win figures are derived from on-chain protocol economics (Morpho LIF, Beefy `callReward`, auction spreads) minus gas and swap haircut.
+
+### Per-win profit
+
+| Strategy | Per win | Wins/week | Notes |
+|---|---|---|---|
+| **Morpho micro-liquidations** | **$0.50 – $6.00** (avg ~$2.10) | 4 – 15 | Scales with position size (4–7% LIF) |
+| **Vault harvest bounties** | **$0.06 – $0.30** (avg ~$0.12) | 12 – 28 | Small because keepers are fast |
+| **Dutch auctions** | **$0.15 – $1.20** (avg ~$0.40) | 0 – 10* | *$0 while `[]` is empty |
+
+### Weekly and monthly (the numbers that matter)
+
+| Scenario | Weekly | Monthly (×4.3) | When |
+|---|---|---|---|
+| **Quiet week** (flat market) | **~$7.50** | **~$32** | Most weeks |
+| **Average week** | **~$22** | **~$95** | Typical operating case |
+| **Volatile week** (ETH ±5%) | **~$54.50+** | **~$235+** | Liquidation clusters |
+
+**The realistic planning band is roughly $65–150/month**, with $95/month as the honest midpoint and $32–235 as the outer range. Volatile weeks are where the money actually is — quiet weeks are near-zero.
+
+**Per-strategy monthly (average case):**
+
+| Strategy | Monthly |
+|---|---|
+| Morpho liquidations | ~$36 |
+| Vault harvests | ~$10 |
+| Dutch auctions | ~$12 (only once configured) |
+| **Combined** | **~$95** |
+
+> Run `python scripts/estimate_royale.py` to see the live model with your current target counts.
+
+---
+
+## Success Probability & Tries:Success Ratio
+
+| Mode | Simulated | Verified | Ratio |
+|---|---|---|---|
+| **Dry-run soak (measured)** | 40,200 | **0** | **0.00%** |
+| **Live, deployed executor (estimated)** | — | — | **2–5%** (≈ 20:1 to 50:1) |
+
+**Why the soak shows 0%:** the Rust sniper simulates `stateOverride` calls against an **undeployed** executor. Until you deploy and go live, `passed` can never be true. That is the safety gate working as designed.
+
+**Per-strategy live probability:**
+
+| Strategy | Probability | Condition |
+|---|---|---|
+| Morpho | ~0.1 – 1% | HF ≤ 1.08 borrower exists **and** swap haircut still leaves profit > $0.05 |
+| Dutch | ~0.5 – 2% | Spread > gas + swap fees (and pipeline configured) |
+| Harvest | ~1 – 5% | `callReward` > $0.05 |
+
+**Expected live cadence:** 1–5 wins/day when markets move; 0 for days at a time when they don't.
+
+---
+
+## What Can Go Wrong
+
+This is the section that matters. Every item is real.
+
+### Gas & paymaster
+
+| Risk | Impact | Mitigation |
+|---|---|---|
+| **Paymaster quota exhausted** | Live submission stops; bot goes silent | Track quota; provider dashboard; fallback provider |
+| **Paymaster rate-limits / 429** | Dropped UserOps | Backoff; rotate providers |
+| **Paymaster revoked / TOS change** | Total loss of execution ability | **No fallback implemented yet** (see Roadmap) |
+| **Sponsorship latency spike** | Misses the opportunity entirely | Accepted design limit |
+| **Bundler rejects UserOp** | Trade lost | Simulation-first reduces this; nonce tracking |
+
+> **Provider quotas vary and change without notice.** Reported free tiers (CDP, Pimlico, Alchemy, ZeroDev) differ widely and are **not guaranteed** — verify current limits in each provider's dashboard before relying on them.
+
+### Strategy & market
+
+| Risk | Impact | Mitigation |
+|---|---|---|
+| **Zero opportunities for days** | $0 revenue, which is normal | Set expectations; this is event-driven |
+| **MEV competition snipes the trade** | Simulated profit never realized | Only target slow-decay opportunities |
+| **Stale oracle / stale targets** | Wrong decision | `MAX_ORACLE_AGE_SEC` = 7200; TTL checks |
+| **Swap slippage / thin liquidity** | Profit evaporates | QuoterV2 + `minAmountsOut[]` guards |
+| **Morpho position state changes mid-block** | Revert | On-chain profit assertion reverts safely |
+| **Dutch ABI mismatch** | Revert or wrong call | Interfaces vary per protocol — verify each |
+
+### Operational
+
+| Risk | Impact | Mitigation |
+|---|---|---|
+| **RPC outage / lag** | Missed blocks, stale data | Rotate RPCs; health checks |
+| **Nonce desync** | Stuck or duplicate UserOps | SQLite nonce tracking |
+| **Circuit breaker trips** | 600s pause after 5 failures | Expected; auto-recovers |
+| **Private key compromise** | Total loss | Never commit; hardware wallet for large funds |
+| **Silent crash of a terminal** | Partial operation | Monitor dashboard; heartbeats |
+| **No independent audit** | Unknown contract risk | **Get an audit before real capital** |
+
+### The one that bites hardest
+**A revert costs $0 while sponsored — but if you ever enable self-funded gas, a revert costs real earned money.** Any future self-funded mode needs a hard spend guard. See Roadmap.
+
+---
+
+## Pros & Cons
+
+### ✅ Pros
+
+- **Truly $0 upfront capital** — flash loans + permissionless calls, no inventory needed.
+- **Truly $0 gas** while sponsored — off-chain signing, paymaster covers L2 gas.
+- **Fail-closed by design** — triple gate (Rust sim → Python re-validate → bundler estimate) means no blind spending.
+- **40,200 free simulations** prove the gate works — it refused to fire on junk.
+- **Clean codebase** — Rust builds with zero warnings; contract passes 5 unit + 1 fork test.
+- **Modular** — three independent pipelines; add targets without redeploying.
+- **Deterministic deployment** — CREATE2 means a predictable executor address.
+- **Real safety rails** — idempotency, circuit breaker, profit assertion, slippage guards.
+- **Double-click launch** — `start.bat` validates everything before it runs.
+
+### ❌ Cons
+
+- **Low frequency** — days can pass with zero wins. This is the dominant downside.
+- **Paymaster dependency** — a single point of failure with **no implemented fallback**.
+- **Not latency-competitive** — 150–350ms sponsorship kills any race strategy.
+- **Small per-win size** on Base L2 (cheap gas → keepers harvest bounties fast).
+- **Pipeline B ships disabled** — you must supply auction contracts.
+- **Not audited** — real capital carries unaudited-contract risk.
+- **Complex ops surface** — Python + Rust + Solidity + ERC-4337 + SQLite.
+- **Profit is irregular** — budgeting on a monthly average hides long dry spells.
+- **Revenue is model-derived, not yet measured** — the soak found nothing to measure.
+
+---
+
+## Safety Invariants
+
+| Guarantee | Mechanism |
+|---|---|
+| **$0 capital at rest** | Executor never holds tokens; no approvals |
+| **$0 EOA gas** | Paymaster sponsors; UserOp signing is off-chain ECDSA |
 | **No-profit, no-send** | Executor reverts unless `balanceAfter - balanceBefore >= minProfit` |
-| **No-blind-submission** | Rust simulates before emitting opportunity (Multicall3 stateOverride) |
-| **Paymaster is a dependency** | Sponsorship can be rate-limited or revoked (free tiers have quotas) |
-| **Circuit breaker** | 5 consecutive failures → 600s cooldown, then resume automatically |
-| **Idempotency** | SQLite `state.db` deduplication prevents double-execution |
-| **Stale target rejection** | Targets > 300s old are held fire (prevents stale price trades) |
+| **No-blind-submission** | Rust simulates before emitting |
+| **Triple simulation gate** | Rust `eth_call` → Python re-validation → bundler `eth_estimateUserOperationGas` |
+| **Idempotency** | Dedupe on `(strategy, target, block, calldata)` in SQLite |
+| **Circuit breaker** | 5 consecutive failures → 600s cooldown |
+| **Allowlisting** | Routers, tokens, auctions, strategies, markets |
 
 ---
 
-## 📦 Production Readiness Score
+## Roadmap — Explicitly Not Implemented
 
-| Component | Score | Notes |
-|-----------|-------|-------|
-| Smart Contract | 8/10 | Hardened, not audited |
-| Python Indexer | 8/10 | Full filter set, GraphQL + on-chain |
-| Rust Sniper | 9/10 | Zero warnings, rotating window |
-| AA/Paymaster | 7/10 | v0.6/v0.7 support, quota-dependent |
-| State/Idempotency | 8/10 | SQLite dedup, circuit breaker |
+Documented so nobody assumes these work today.
+
+### 1. Dutch pipeline activation (cheapest win)
+`DUTCH_AUCTION_CONTRACTS_JSON=[]` means Pipeline B is dormant. Adding 5–10 live Base auction contracts turns it on with **zero new contracts and zero new latency risk**.
+
+### 2. Immortal Mode — self-funded gas fallback (**design only**)
+Goal: keep trading when the paymaster throttles, by paying gas from **earned profit** inside the `SimpleAccount`.
+
+It is *mechanically sound* — EntryPoint charges the **sender**, not the EOA, so the EOA still needs 0 ETH. But it is **not implemented**. Required work:
+
+1. **Split the URLs** — `config.py:18-19` currently reads `BUNDLER_RPC_URL` and `PAYMASTER_RPC_URL` from the **same** env var, so a bundler-without-paymaster is impossible.
+2. **Allow the no-paymaster path** — remove the `aa.py:411` hard gate for the self-funded branch.
+3. **Gas tank manager** — profit arrives as WETH/USDC, but gas needs native ETH, and `WETH.withdraw()` is itself a paid tx. The fix is a **proactive, paymaster-sponsored unwrap right after the first win**, so ETH sits in the `SimpleAccount` *before* the paymaster dies.
+4. **Hard spend guard** — mandatory, because self-funded reverts cost real money:
+   - profit must be ≥ **3×** gas cost
+   - lifetime self-funded gas ≤ **20%** of realized profit
+   - **2** consecutive self-funded reverts → lock the fallback
+
+> Do not enable self-funded gas without the spend guard. It converts "$0 risk" into "bounded but real risk."
+
+### 3. Additional pipelines
+**Not recommended yet.** The bottleneck is signal, not surface area. Add pipelines only once you are leaving verified-but-unsubmitted opportunities on the table.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `DRY_RUN_SIMULATED`, never submits | No paymaster configured | Set `PAYMASTER_BUNDLER_RPC` |
+| `0 verified` forever in dry-run | Executor not deployed | Expected — deploy to go live |
+| `pip install failed` in preflight | Missing build tools | Install Visual C++ Build Tools |
+| `cargo build` fails | Rust toolchain missing | `rustup update stable` |
+| Paymaster `429` | Rate limited | Wait 24h or rotate provider |
+| Circuit breaker tripped | 5 consecutive failures | Auto-recovers in 600s |
+| `PAYMASTER_BUNDLER_RPC missing` warning | Not set in `.env` | Simulation-only until set |
+| Dutch shows 0 targets | Pipeline disabled | Populate `DUTCH_AUCTION_CONTRACTS_JSON` |
+| Stale targets | Indexer down | Check orchestrator terminal |
+
+---
+
+## Verification Checklist Before Any Mainnet Execution
+
+- [x] EntryPoint v0.6, Morpho, router, auction, vault addresses confirmed (8453)
+- [x] Contract compiles + 5 unit tests + 1 fork test pass
+- [x] Rust release build: 0 warnings
+- [x] Python modules compile clean
+- [x] Soak: 1.38h, 1,682 cycles, 40,200 sims, 0 verified (gate working)
+- [x] Paymaster probe passes with your key
+- [x] Executor deployed via CREATE2
+- [ ] **Independent Solidity audit** ← required before real capital
+- [ ] Circuit breakers tuned (max gas, max notional, max failures, stale TTL)
+- [ ] Dutch auctions configured (optional, recommended)
+
+---
+
+## Production Readiness
+
+| Component | Score | Note |
+|---|---|---|
+| Smart contract | 8/10 | Hardened, **not audited** |
+| Python indexer | 8/10 | Full filter set |
+| Rust sniper | 9/10 | Zero warnings, rotating window |
+| AA / paymaster | 7/10 | v0.6/v0.7 support; no fallback |
+| State / idempotency | 8/10 | SQLite dedup + circuit breaker |
 | Monitoring | 8/10 | Live dashboard, heartbeats |
 | Testing | 8/10 | 6/6 EVM tests pass |
-| **Overall** | **8/10** | **Ready pending independent audit** |
+| **Overall** | **8/10** | Ready **pending audit** |
 
 ---
 
-## 🎯 Next Steps
+## License
 
-1. **Get paymaster endpoint** (Coinbase CDP: https://portal.cdp.coinbase.com OR Pimlico: https://dashboard.pimlico.io)
-2. **Run setup wizard**: `python scripts/setup.py --yes`
-3. **Or double-click start.bat** → follow launch menu
-4. **Monitor first week**: `python -m orchestrator.monitor --once`
-5. **Watch weekly income grow** from $0 → $15-35/week baseline
-6. **Consider independent audit** before scaling capital
+Scaffold for educational and experimental purposes. **Not financial advice.** Use at your own risk.
 
----
-
-## 📞 Support & Contact
-
-- **Issues**: Open a GitHub issue at the repository
-- **Paymaster help**: Coinbase CDC docs or Pimlico dashboard
-- **Profit questions**: Run `python scripts/estimate_royale.py` for current estimates
-- **Urgent problems**: Check `failures.txt` and `state.db` in repo root
-
----
-
-Scaffold for educational and experimental purposes. Not financial advice. Use at your own risk.
-
----
-
-**Last Updated**: `git log --oneline -1` (commit hash from repository)
-
-**Repository**: `https://github.com/arshmicrosoft-boop/zerro-defi.git`
+MEV and keeper operation carries real risk including total loss of funds, failed transactions, and regulatory exposure. This software is provided as-is, without warranty of any kind. You are responsible for auditing, testing, and understanding every line before deploying capital.
