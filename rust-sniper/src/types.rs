@@ -23,6 +23,16 @@ pub struct MorphoTarget {
     pub seized_assets: String,
     pub repaid_shares: String,
     pub swap_fee: u32,
+    #[serde(default)]
+    pub swap_kind: String,
+    #[serde(default)]
+    pub swap_path: String,
+    #[serde(default)]
+    pub swap_aero_tokens: Vec<String>,
+    #[serde(default)]
+    pub swap_aero_stable: Vec<bool>,
+    #[serde(default = "default_tier")]
+    pub tier_pct: u32,
     pub min_profit_raw: String,
     #[serde(default)]
     pub profit_token: String,
@@ -64,6 +74,7 @@ pub struct HarvestTarget {
 
 fn default_decimals() -> u32 { 18 }
 fn default_price() -> f64 { 1.0 }
+fn default_tier() -> u32 { 100 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidateCall {

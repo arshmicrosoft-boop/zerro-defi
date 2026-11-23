@@ -48,6 +48,9 @@ UNIT_TESTS = [
     "testProfitableDutchAuctionWithSlippageGuards",
     "testProfitableHarvestBountyAndAllowlistGuard",
     "testRevertOnUnauthorizedCallbacks",
+    "testRoutedMultiHopLiquidation",
+    "testRoutedAerodromeLiquidation",
+    "testFlashAction",
 ]
 
 FORK_TESTS = [
@@ -94,29 +97,42 @@ def _eth_call(payload: dict, timeout: int = 30) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def run_solidity_unit_tests_on_evm(test_runtime_bytecode: str, run_all_selector: str) -> None:
+def run_solidity_unit_tests_on_evm(test_runtime_bytecode: str, run_one_selector: str) -> None:
     test_addr = "0x0000000000000000000000000000000000007E57"
     started = time.perf_counter()
-    body = _eth_call(
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_call",
-            "params": [
-                {"to": test_addr, "data": "0x" + run_all_selector, "gas": hex(50_000_000)},
-                "latest",
-                {test_addr: {"code": test_runtime_bytecode}},
-            ],
-        }
+    passed = 0
+    for idx, name in enumerate(UNIT_TESTS):
+        body = _eth_call(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_call",
+                "params": [
+                    {
+                        "to": test_addr,
+                        "data": "0x" + run_one_selector + f"{idx:064x}",
+                        "gas": hex(80_000_000),
+                    },
+                    "latest",
+                    {test_addr: {"code": test_runtime_bytecode}},
+                ],
+            }
+        )
+        if "error" in body:
+            raise RuntimeError(f"unit test #{idx} ({name}) reverted in EVM: {body['error']}")
+        if int(body.get("result", "0x0"), 16) != 1:
+            raise RuntimeError(f"unit test #{idx} ({name}) did not pass")
+        passed += 1
+
+    if passed != len(UNIT_TESTS):
+        raise RuntimeError(f"expected {len(UNIT_TESTS)} passing unit tests, got {passed}")
+
+    status(
+        "ok",
+        "unit tests",
+        f"{passed}/{len(UNIT_TESTS)} passed · Cancun EVM",
+        time.perf_counter() - started,
     )
-    if "error" in body:
-        raise RuntimeError(f"Solidity unit suite reverted in EVM: {body['error']}")
-
-    passed = int(body.get("result", "0x0"), 16)
-    if passed != 5:
-        raise RuntimeError(f"expected 5 passing unit tests, got {passed}")
-
-    status("ok", "unit tests", f"{passed}/5 passed · Cancun EVM", time.perf_counter() - started)
     _sub_lines(UNIT_TESTS)
 
 
@@ -227,7 +243,7 @@ def compile_executor() -> dict:
     test_data = output["contracts"]["test/ZeroCapOmniExecutor.t.sol"]["ZeroCapOmniExecutorTest"]
     run_solidity_unit_tests_on_evm(
         "0x" + test_data["evm"]["deployedBytecode"]["object"],
-        test_data["evm"]["methodIdentifiers"]["runAllTests()"],
+        test_data["evm"]["methodIdentifiers"]["runOne(uint256)"],
     )
 
     if "test/ZeroCapMainnetFork.t.sol" in output["contracts"]:

@@ -2,10 +2,10 @@ import asyncio
 import json
 import os
 import time
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 import aiohttp
 from eth_abi import decode as abi_decode, encode as abi_encode
-from eth_utils import to_checksum_address
+from eth_utils import keccak, to_checksum_address
 
 from . import ui
 from .config import (
@@ -34,7 +34,30 @@ SEL_BALANCE_OF = bytes.fromhex("70a08231")
 
 UNISWAP_QUOTER_V2 = "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"
 SEL_QUOTE_EXACT_INPUT_SINGLE = bytes.fromhex("c6a5026a")
+SEL_QUOTE_EXACT_INPUT = keccak(text="quoteExactInput(bytes,uint256)")[:4]
 UNI_FEE_TIERS = [100, 500, 3000, 10000]
+
+# Aerodrome (Solidly-fork) routing. Base's deepest liquidity for several
+# Morpho collateral tokens lives here, not on Uniswap V3.
+AERODROME_ROUTER = "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43"
+AERODROME_FACTORY = "0x420DD381b31aEf6683db6B902084cB0FFECe40Da"
+SEL_AERO_GET_AMOUNTS_OUT = keccak(
+    text="getAmountsOut(uint256,(address,address,bool,address)[])"
+)[:4]
+
+# Intermediate hops tried for two-hop routes (collateral -> mid -> loan).
+HOP_MIDS: List[str] = [WETH_BASE, USDC_BASE]
+# Fee combinations for the two Uniswap V3 hops, ordered by common Base pools.
+HOP_FEE_PAIRS: List[Tuple[int, int]] = [
+    (500, 500),
+    (3000, 3000),
+    (500, 3000),
+    (3000, 500),
+    (100, 500),
+    (500, 100),
+    (10000, 500),
+    (500, 10000),
+]
 
 MAX_ORACLE_AGE_SEC = int(os.getenv("MAX_ORACLE_AGE_SEC", "7200"))
 MIN_POSITION_USD = float(os.getenv("MIN_POSITION_USD", "2.00"))
@@ -61,6 +84,20 @@ def mul_div_down(x: int, y: int, d: int) -> int:
 
 def mul_div_up(x: int, y: int, d: int) -> int:
     return (x * y + (d - 1)) // d if d > 0 else 0
+
+
+def encode_uni_v3_path(tokens: List[str], fees: List[int]) -> bytes:
+    """Pack a Uniswap V3 multi-hop path: tokenIn | fee | tokenMid | fee | tokenOut.
+
+    Each token is 20 bytes and each fee is 3 bytes, matching the router's
+    `exactInput` path encoding.
+    """
+    out = b""
+    for i, token in enumerate(tokens):
+        out += bytes.fromhex(token[2:].lower().rjust(40, "0"))
+        if i < len(fees):
+            out += int(fees[i]).to_bytes(3, "big")
+    return out
 
 
 def w_taylor_compounded(x: int, n: int) -> int:
@@ -137,6 +174,7 @@ class BaseStateIndexer:
     def __init__(self) -> None:
         self.rpc_idx = 0
         self.tracked_positions: Dict[Tuple[str, str], None] = {}
+        self.last_morpho_funnel: dict = {}
         self.market_params_cache: Dict[str, Tuple[str, str, str, str, int]] = {}
         self.token_decimals_cache: Dict[str, int] = {
             USDC_BASE.lower(): 6,
@@ -271,6 +309,180 @@ class BaseStateIndexer:
                 except Exception:
                     continue
         return (best_fee, best_amount_out)
+
+    async def _quote_uni_multi(
+        self,
+        session: aiohttp.ClientSession,
+        token_in: str,
+        token_out: str,
+        amount_in: int,
+    ) -> Optional[dict]:
+        """Quote two-hop Uniswap V3 routes through WETH and USDC."""
+        if amount_in <= 0:
+            return None
+        combos = []
+        for mid in HOP_MIDS:
+            if mid.lower() in (token_in.lower(), token_out.lower()):
+                continue
+            for fee_a, fee_b in HOP_FEE_PAIRS:
+                path = encode_uni_v3_path([token_in, mid, token_out], [fee_a, fee_b])
+                combos.append((fee_a, fee_b, path))
+        if not combos:
+            return None
+
+        calls = [
+            (
+                UNISWAP_QUOTER_V2,
+                SEL_QUOTE_EXACT_INPUT + abi_encode(["bytes", "uint256"], [path, amount_in]),
+            )
+            for _, _, path in combos
+        ]
+        results = await self._multicall(session, calls)
+
+        best = None
+        for (fee_a, _fee_b, path), (ok, data) in zip(combos, results):
+            if not ok or len(data) < 32:
+                continue
+            try:
+                out = int(abi_decode(["uint256"], data[:32])[0])
+            except Exception:
+                continue
+            if best is None or out > best["amount_out"]:
+                best = {
+                    "kind": "uni_multi",
+                    "fee": fee_a,
+                    "path": path,
+                    "tokens": [],
+                    "stable": [],
+                    "amount_out": out,
+                }
+        return best
+
+    async def _quote_aero(
+        self,
+        session: aiohttp.ClientSession,
+        token_in: str,
+        token_out: str,
+        amount_in: int,
+    ) -> Optional[dict]:
+        """Quote Aerodrome direct and two-hop routes (stable + volatile pools)."""
+        if amount_in <= 0:
+            return None
+
+        candidates: List[Tuple[List[str], List[bool]]] = []
+        for stable in (False, True):
+            candidates.append(([token_in, token_out], [stable]))
+        for mid in HOP_MIDS:
+            if mid.lower() in (token_in.lower(), token_out.lower()):
+                continue
+            for s1 in (False, True):
+                for s2 in (False, True):
+                    candidates.append(([token_in, mid, token_out], [s1, s2]))
+
+        calls = []
+        encoded = []
+        for tokens, stables in candidates:
+            route_tuples = [
+                (
+                    to_checksum_address(tokens[i]),
+                    to_checksum_address(tokens[i + 1]),
+                    stables[i],
+                    AERODROME_FACTORY,
+                )
+                for i in range(len(tokens) - 1)
+            ]
+            encoded.append((tokens, stables))
+            calls.append(
+                (
+                    AERODROME_ROUTER,
+                    SEL_AERO_GET_AMOUNTS_OUT
+                    + abi_encode(
+                        ["uint256", "(address,address,bool,address)[]"],
+                        [amount_in, route_tuples],
+                    ),
+                )
+            )
+
+        results = await self._multicall(session, calls)
+
+        best = None
+        for (tokens, stables), (ok, data) in zip(encoded, results):
+            if not ok or len(data) < 64:
+                continue
+            try:
+                amounts = abi_decode(["uint256[]"], data)[0]
+            except Exception:
+                continue
+            if not amounts:
+                continue
+            out = int(amounts[-1])
+            if best is None or out > best["amount_out"]:
+                best = {
+                    "kind": "aero",
+                    "fee": 0,
+                    "path": b"",
+                    "tokens": [to_checksum_address(t) for t in tokens],
+                    "stable": stables,
+                    "amount_out": out,
+                }
+        return best
+
+    async def _select_best_route(
+        self,
+        session: aiohttp.ClientSession,
+        token_in: str,
+        token_out: str,
+        amount_in: int,
+        needed_out: int = 0,
+    ) -> Optional[dict]:
+        """Pick the highest-output route across Uni single/multi-hop and Aerodrome.
+
+        All four route types are probed and the one with the greatest estimated
+        output wins.  Afterwards we check whether that best output meets
+        ``needed_out``; if it does not, the route is still returned so that the
+        caller can decide how to proceed (e.g. skip the opportunity or lower
+        the profit threshold).
+        """
+        if amount_in <= 0:
+            return None
+        if token_in.lower() == token_out.lower():
+            return {
+                "kind": "none",
+                "fee": 0,
+                "path": b"",
+                "tokens": [],
+                "stable": [],
+                "amount_out": amount_in,
+            }
+
+        # Quote all available route types concurrently.
+        fee, out = await self._select_best_uni_v3_fee(session, token_in, token_out, amount_in)
+        best = {
+            "kind": "uni_single",
+            "fee": fee,
+            "path": b"",
+            "tokens": [],
+            "stable": [],
+            "amount_out": out,
+        }
+
+        # Multi-hop Uniswap V3 (2-hop via WETH/USDC midpoints)
+        multi = await self._quote_uni_multi(session, token_in, token_out, amount_in)
+        if multi and multi["amount_out"] > best["amount_out"]:
+            best = multi
+
+        # Aerodrome (direct + 2-hop through stable/unstable pools)
+        aero = await self._quote_aero(session, token_in, token_out, amount_in)
+        if aero and aero["amount_out"] > best["amount_out"]:
+            best = aero
+
+        # Check if the best route clears the needed-out threshold.
+        if needed_out > 0 and best["amount_out"] < needed_out:
+            # Still return the best route so the caller can decide to lower
+            # the profit threshold or skip this opportunity.
+            pass
+
+        return best
 
     async def fetch_beefy_harvest_targets(self, session: aiohttp.ClientSession) -> List[dict]:
         targets = []
@@ -501,11 +713,25 @@ class BaseStateIndexer:
         pos_results = await self._multicall(session, pos_calls)
 
         candidates = []
+        funnel = {
+            "positions": len(pos_keys),
+            "unreadable": 0,
+            "zero_shares": 0,
+            "denylisted_or_stale": 0,
+            "hf_rejected": 0,
+            "below_min_position": 0,
+            "no_route": 0,
+            "below_profit": 0,
+            "tier_skipped": 0,
+            "emitted": 0,
+        }
         for (m_id, borrower), (ok, data) in zip(pos_keys, pos_results):
             if not ok or len(data) < 96 or m_id not in self.market_params_cache or m_id not in market_totals:
+                funnel["unreadable"] += 1
                 continue
             _, borrow_shares, collateral = abi_decode(["uint256", "uint128", "uint128"], data)
             if borrow_shares == 0 or collateral == 0:
+                funnel["zero_shares"] += 1
                 continue
 
             loan_token, coll_token, oracle, irm, lltv = self.market_params_cache[m_id]
@@ -516,6 +742,7 @@ class BaseStateIndexer:
                 or coll_token.lower() in DENYLIST_TOKENS
                 or oracle.lower() in stale_oracles
             ):
+                funnel["denylisted_or_stale"] += 1
                 continue
 
             oracle_price = oracle_prices.get(oracle.lower(), 0)
@@ -530,6 +757,7 @@ class BaseStateIndexer:
                 int(lltv),
             )
             if not is_liq:
+                funnel["hf_rejected"] += 1
                 continue
 
             min_profit_raw, loan_dec, loan_usd_price = await self.usd_to_token_raw(
@@ -538,36 +766,100 @@ class BaseStateIndexer:
 
             expected_repaid_usd = (expected_repaid / (10**loan_dec)) * loan_usd_price
             if expected_repaid_usd < MIN_POSITION_USD:
+                funnel["below_min_position"] += 1
                 continue
 
-            quote_collateral_in = seized_assets if seized_assets > 0 else int(collateral)
-            best_fee, quoted_loan_out = await self._select_best_uni_v3_fee(
-                session, coll_token, loan_token, quote_collateral_in
+            lif = compute_lif(int(lltv))
+            # Collateral seized when repaying the entire debt (debt-exact path).
+            seized_full = mul_div_down(
+                mul_div_up(int(expected_repaid), lif, WAD),
+                ORACLE_PRICE_SCALE,
+                oracle_price,
             )
-            if quoted_loan_out == 0:
-                continue
 
-            haircut_loan_out = (quoted_loan_out * SWAP_HAIRCUT_BPS) // 10000
-            if hf <= 1.0 and haircut_loan_out < expected_repaid + min_profit_raw:
-                continue
+            # Build (tier_pct, seized_assets, repaid_shares, collateral_in) plans.
+            # Liquidatable positions get the 25/50/100% ladder so Rust can pick the
+            # size that best balances DEX slippage against the liquidation bonus.
+            # Warm targets (1.0 < HF <= ceiling) get one full-size plan so they are
+            # already armed when the oracle ticks them under 1.0.
+            if hf <= 1.0 and int(repaid_shares) > 0:
+                plan = []
+                for pct in (25, 50, 100):
+                    tier_shares = int(borrow_shares) * pct // 100
+                    if tier_shares <= 0:
+                        continue
+                    plan.append((pct, 0, tier_shares, seized_full * pct // 100))
+            elif hf <= 1.0:
+                # Bad-debt branch: seize collateral directly (repaidShares = 0).
+                plan = []
+                for pct in (25, 50, 100):
+                    tier_seized = int(collateral) * pct // 100
+                    if tier_seized <= 0:
+                        continue
+                    plan.append((pct, tier_seized, 0, tier_seized))
+            else:
+                if int(repaid_shares) > 0:
+                    plan = [(100, 0, int(repaid_shares), seized_full)]
+                else:
+                    plan = [(100, int(seized_assets), 0, int(seized_assets))]
 
-            candidates.append(
-                {
-                    "loan_token": to_checksum_address(loan_token),
-                    "collateral_token": to_checksum_address(coll_token),
-                    "oracle": to_checksum_address(oracle),
-                    "irm": to_checksum_address(irm),
-                    "lltv": str(lltv),
-                    "borrower": to_checksum_address(borrower),
-                    "seized_assets": str(seized_assets),
-                    "repaid_shares": str(repaid_shares),
-                    "swap_fee": best_fee,
-                    "min_profit_raw": str(min_profit_raw),
-                    "profit_token": to_checksum_address(loan_token),
-                    "profit_decimals": loan_dec,
-                    "token_price_usd": loan_usd_price,
-                    "health_factor": round(hf, 6),
-                }
+            for tier_pct, tier_seized_assets, tier_repaid_shares, collateral_in in plan:
+                tier_repaid_assets = int(expected_repaid) * tier_pct // 100
+                tier_repaid_usd = (tier_repaid_assets / (10**loan_dec)) * loan_usd_price
+                if tier_repaid_usd < MIN_POSITION_USD:
+                    funnel["tier_skipped"] += 1
+                    continue
+
+                tier_needed_out = tier_repaid_assets + min_profit_raw
+                route = await self._select_best_route(
+                    session, coll_token, loan_token, collateral_in, tier_needed_out
+                )
+                if route is None or route["amount_out"] == 0:
+                    funnel["no_route"] += 1
+                    continue
+
+                haircut_out = (route["amount_out"] * SWAP_HAIRCUT_BPS) // 10000
+                if hf <= 1.0 and haircut_out < tier_needed_out:
+                    funnel["below_profit"] += 1
+                    continue
+
+                candidates.append(
+                    {
+                        "loan_token": to_checksum_address(loan_token),
+                        "collateral_token": to_checksum_address(coll_token),
+                        "oracle": to_checksum_address(oracle),
+                        "irm": to_checksum_address(irm),
+                        "lltv": str(lltv),
+                        "borrower": to_checksum_address(borrower),
+                        "seized_assets": str(tier_seized_assets),
+                        "repaid_shares": str(tier_repaid_shares),
+                        "swap_fee": route["fee"],
+                        "swap_kind": route["kind"],
+                        "swap_path": "0x" + route["path"].hex() if route["path"] else "",
+                        "swap_aero_tokens": route["tokens"],
+                        "swap_aero_stable": route["stable"],
+                        "min_profit_raw": str(min_profit_raw),
+                        "profit_token": to_checksum_address(loan_token),
+                        "profit_decimals": loan_dec,
+                        "token_price_usd": loan_usd_price,
+                        "health_factor": round(hf, 6),
+                        "tier_pct": tier_pct,
+                    }
+                )
+                funnel["emitted"] += 1
+
+        self.last_morpho_funnel = funnel
+        if funnel["positions"] > 0:
+            ui.log(
+                "indexer",
+                "morpho funnel · "
+                f"pos={funnel['positions']} unreadable={funnel['unreadable']} "
+                f"zero={funnel['zero_shares']} deny/stale={funnel['denylisted_or_stale']} "
+                f"hf>{WATCHLIST_HF_CEILING}={funnel['hf_rejected']} "
+                f"small<${MIN_POSITION_USD:.0f}={funnel['below_min_position']} "
+                f"no_route={funnel['no_route']} below_profit={funnel['below_profit']} "
+                f"tier_skip={funnel['tier_skipped']} emitted={funnel['emitted']}",
+                "info",
             )
         return candidates
 
@@ -668,6 +960,7 @@ class BaseStateIndexer:
             "dutch": len(dutch_targets),
             "harvest": len(harvest_targets),
             "tracked": len(self.tracked_positions),
+            "morpho_funnel": self.last_morpho_funnel,
             "duration_ms": int((time.perf_counter() - started) * 1000),
         }
         ui.log(

@@ -16,3 +16,5 @@ anyhow = "1.0"
 dotenvy = "0.15"
 alloy-primitives = { version = "0.7", features = ["serde"] }
 alloy-sol-types = "0.7"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"

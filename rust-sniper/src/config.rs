@@ -10,6 +10,7 @@ pub struct SniperConfig {
     pub status_file: String,
     pub min_profit_usd: f64,
     pub poll_interval_ms: u64,
+    pub ws_url: Option<String>,
 }
 
 impl SniperConfig {
@@ -30,6 +31,10 @@ impl SniperConfig {
             status_file: env::var("STATUS_PATH").unwrap_or_else(|_| "../runtime/sniper_status.json".into()),
             min_profit_usd: env::var("MIN_PROFIT_USD").ok().and_then(|v| v.parse().ok()).unwrap_or(0.05),
             poll_interval_ms: env::var("BLOCK_POLL_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(500),
+            ws_url: env::var("BASE_WS_URL")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
         }
     }
 }

@@ -3,6 +3,7 @@ mod pipelines;
 mod sim;
 mod types;
 mod ui;
+mod ws;
 
 use config::SniperConfig;
 use pipelines::{
@@ -11,7 +12,7 @@ use pipelines::{
 };
 use reqwest::Client;
 use sim::{get_block_number, simulate_batch_on_multicall3};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -42,6 +43,8 @@ struct Stats {
     targets_missing: bool,
     executor_onchain: bool,
     rpc_host: String,
+    ws_enabled: bool,
+    ws_blocks: u64,
     last_error: String,
     events: VecDeque<(u64, &'static str, String)>,
 }
@@ -68,6 +71,8 @@ impl Stats {
             targets_missing: false,
             executor_onchain: !cfg.executor_address.eq_ignore_ascii_case("0x0000000000000000000000000000000000000000"),
             rpc_host: host_of(cfg.rpc_urls.first().map(|s| s.as_str()).unwrap_or("")),
+            ws_enabled: cfg.ws_url.is_some(),
+            ws_blocks: 0,
             last_error: String::new(),
             events: VecDeque::with_capacity(64),
         }
@@ -153,6 +158,15 @@ fn render(stats: &Stats, cfg: &SniperConfig, started: Instant) -> Vec<String> {
     } else {
         paint("stateOverride", AMBER, true)
     };
+    let ws_chip = if stats.ws_enabled {
+        format!(
+            "  {} {}",
+            paint("· ws", FAINT, false),
+            paint(&format!("{}", stats.ws_blocks), MUTED, false)
+        )
+    } else {
+        String::new()
+    };
     frame.pair(
         &format!(
             "{} {}  {} {}  {} {}",
@@ -164,9 +178,10 @@ fn render(stats: &Stats, cfg: &SniperConfig, started: Instant) -> Vec<String> {
             paint(&ui::usd(cfg.min_profit_usd), INK, false),
         ),
         &format!(
-            "{}{}",
+            "{}{}{}",
             paint("poll ", FAINT, false),
             paint(&format!("{}ms", cfg.poll_interval_ms), FAINT, false),
+            ws_chip,
         ),
     );
 
@@ -288,6 +303,8 @@ fn write_status(cfg: &SniperConfig, stats: &Stats, started: Instant) {
         "latency_ms": stats.latency_ms,
         "rpc": stats.rpc_host,
         "stale": stats.stale,
+        "ws_enabled": stats.ws_enabled,
+        "ws_blocks": stats.ws_blocks,
         "error": stats.last_error,
         "cycles": stats.cycles,
         "morpho": stats.morpho,
@@ -324,6 +341,17 @@ async fn main() -> anyhow::Result<()> {
     let mut screen = Screen::new();
     screen.enter();
     let mut rpc_idx = 0usize;
+
+    // Block-triggered simulation: wake on every new head, with the HTTP poll as
+    // a fallback so the loop still runs if the WebSocket is unavailable.
+    let mut ws_rx: Option<tokio::sync::mpsc::Receiver<u64>> = None;
+    if let Some(url) = cfg.ws_url.clone() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<u64>(16);
+        let ws_url = url.clone();
+        tokio::spawn(async move { ws::run_new_heads(ws_url, tx).await });
+        stats.event("info", format!("newHeads ws armed · {}", host_of(&url)));
+        ws_rx = Some(rx);
+    }
 
     loop {
         let cycle_start = Instant::now();
@@ -511,6 +539,37 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 if !verified.is_empty() {
+                    // Collapse the 25/50/100% tier ladder (and any duplicate
+                    // target) to the single highest-profit opportunity per
+                    // (pipeline, description). Submitting two tiers for the same
+                    // borrower would make the second revert once the first
+                    // repairs the position.
+                    if verified.len() > 1 {
+                        let mut best: HashMap<(String, String), VerifiedOpportunity> =
+                            HashMap::new();
+                        for v in verified.into_iter() {
+                            let key = (v.pipeline.clone(), v.description.clone());
+                            let replace = match best.get(&key) {
+                                Some(existing) => {
+                                    let a = v.simulated_profit_raw.parse::<u128>().unwrap_or(0);
+                                    let b =
+                                        existing.simulated_profit_raw.parse::<u128>().unwrap_or(0);
+                                    a > b
+                                }
+                                None => true,
+                            };
+                            if replace {
+                                best.insert(key, v);
+                            }
+                        }
+                        verified = best.into_values().collect();
+                        verified.sort_by(|a, b| {
+                            let ap = a.simulated_profit_raw.parse::<u128>().unwrap_or(0);
+                            let bp = b.simulated_profit_raw.parse::<u128>().unwrap_or(0);
+                            bp.cmp(&ap)
+                        });
+                    }
+
                     if let Ok(out_json) = serde_json::to_string_pretty(&verified) {
                         if fs::write(&cfg.outbox_file, out_json).is_ok() {
                             stats.event(
@@ -533,6 +592,18 @@ async fn main() -> anyhow::Result<()> {
         write_status(&cfg, &stats, started);
         screen.draw(&render(&stats, &cfg, started));
 
-        tokio::time::sleep(Duration::from_millis(cfg.poll_interval_ms)).await;
+        match ws_rx.as_mut() {
+            Some(rx) => {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(cfg.poll_interval_ms)) => {}
+                    maybe = rx.recv() => {
+                        if maybe.is_some() {
+                            stats.ws_blocks += 1;
+                        }
+                    }
+                }
+            }
+            None => tokio::time::sleep(Duration::from_millis(cfg.poll_interval_ms)).await,
+        }
     }
 }
